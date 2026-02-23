@@ -56,4 +56,8 @@ Let's do XPS then. We are doing Cash-secured puts. No margins.
 
 Regarding Target vs Capital toggle, yes show projected monthly income if the user selects a Capital that they have.
 
+## Session 2
+### User
+Say we sell put credit spreads instead. Can you enhance the app to show those as a separate graph? 
+
 

@@ -9,11 +9,10 @@ import datetime
 import math
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="SPY/XSP Cash-Secured Put Analyzer", layout="wide")
-st.title("📈 Cash-Secured Put Analyzer (SPY Proxy)")
+st.set_page_config(page_title="SPY Put Options Analyzer", layout="wide")
+st.title("📈 Put Options Strategy Analyzer (SPY Proxy)")
 st.markdown("""
-*Visualizes historical data and helps you pick the optimal Put Option to sell based on your Delta and Income/Collateral goals.*
-*(Note: We use SPY by default as it provides the most robust free options data via yfinance, and perfectly mimics XSP).*
+*Compare **Cash-Secured Puts (CSP)** and **Put Credit Spreads (PCS)**. Optimize your strategy based on Delta, Income Targets, and Capital constraints.*
 """)
 
 TICKER = "SPY"
@@ -23,7 +22,7 @@ RISK_FREE_RATE = 0.045 # Assumed 4.5% Risk Free Rate for Black-Scholes
 @st.cache_data(ttl=3600)
 def get_historical_data(ticker):
     # Fetch 1 year to ensure we have enough data to calculate the 200 SMA
-    df = yf.download(ticker, period="1y")
+    df = yf.download(ticker, period="1y", progress=False)
     
     # Calculate Moving Averages
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
@@ -49,83 +48,63 @@ st.subheader("1. Price History & Technical Indicators (Last 6 Months)")
 df_6m = df_price[df_price.index >= (pd.Timestamp.today() - pd.DateOffset(months=6))]
 
 fig_price = go.Figure()
-# Candlesticks
 fig_price.add_trace(go.Candlestick(x=df_6m.index, open=df_6m['Open'].squeeze(), high=df_6m['High'].squeeze(), 
                                    low=df_6m['Low'].squeeze(), close=df_6m['Close'].squeeze(), name='Price'))
-# Moving Averages
 fig_price.add_trace(go.Scatter(x=df_6m.index, y=df_6m['SMA_20'].squeeze(), line=dict(color='blue', width=1), name='20 SMA'))
 fig_price.add_trace(go.Scatter(x=df_6m.index, y=df_6m['SMA_50'].squeeze(), line=dict(color='orange', width=1.5), name='50 SMA'))
 fig_price.add_trace(go.Scatter(x=df_6m.index, y=df_6m['SMA_200'].squeeze(), line=dict(color='red', width=2), name='200 SMA'))
-# Bollinger Bands
 fig_price.add_trace(go.Scatter(x=df_6m.index, y=df_6m['BB_Upper'].squeeze(), line=dict(color='gray', width=1, dash='dot'), name='BB Upper'))
 fig_price.add_trace(go.Scatter(x=df_6m.index, y=df_6m['BB_Lower'].squeeze(), fill='tonexty', line=dict(color='gray', width=1, dash='dot'), name='BB Lower'))
 
-fig_price.update_layout(height=500, margin=dict(l=0, r=0, t=30, b=0), xaxis_rangeslider_visible=False)
+fig_price.update_layout(height=400, margin=dict(l=0, r=0, t=30, b=0), xaxis_rangeslider_visible=False)
 st.plotly_chart(fig_price, use_container_width=True)
 
 
 # --- USER INPUTS ---
 st.subheader("2. Setup Your Strategy")
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
-    target_delta = st.slider("Target Delta (Absolute)", min_value=0, max_value=100, value=10, step=1)
+    target_delta = st.slider("Target Delta (Abs)", min_value=0, max_value=100, value=10, step=1)
 with col2:
-    user_strike = st.number_input("Target Strike Price", value=int(default_strike), step=1)
+    user_strike = st.number_input("Target Strike ($)", value=int(default_strike), step=1)
 with col3:
-    goal_type = st.radio("What is your goal constraint?", ["Target Monthly Income", "Capital to Invest"])
+    spread_width = st.number_input("Spread Width ($)", value=5, step=1, help="Difference between short put and long put for credit spreads.")
 with col4:
+    goal_type = st.radio("Goal Constraint", ["Target Monthly Income", "Capital to Invest"])
+with col5:
     if goal_type == "Target Monthly Income":
-        goal_amount = st.number_input("Target Amount per Month ($)", value=1000, step=100)
+        goal_amount = st.number_input("Target Amount / Month ($)", value=1000, step=100)
     else:
-        goal_amount = st.number_input("Available Capital to Invest ($)", value=50000, step=1000)
+        goal_amount = st.number_input("Available Capital ($)", value=50000, step=1000)
 
 # --- BLACK-SCHOLES DELTA CALCULATION ---
 def calc_put_delta(S, K, t_years, r, sigma):
     if t_years <= 0 or sigma <= 0: return 0.0
     d1 = (np.log(S/K) + (r + 0.5 * sigma**2)*t_years) / (sigma * np.sqrt(t_years))
     put_delta = norm.cdf(d1) - 1
-    return abs(put_delta) # Return absolute delta (0.0 to 1.0)
+    return abs(put_delta)
 
 # --- FETCH OPTIONS DATA ---
 @st.cache_data(ttl=600)
 def fetch_options_chain(ticker, current_price):
     tk = yf.Ticker(ticker)
     expirations = tk.options
-    
     today = datetime.date.today()
-    valid_expirations = []
-    
-    # Filter to expirations <= 60 days
-    for exp in expirations:
-        exp_date = datetime.datetime.strptime(exp, '%Y-%m-%d').date()
-        dte = (exp_date - today).days
-        if 0 < dte <= 60:
-            valid_expirations.append((exp, dte))
+    valid_expirations = [(exp, (datetime.datetime.strptime(exp, '%Y-%m-%d').date() - today).days) for exp in expirations if 0 < (datetime.datetime.strptime(exp, '%Y-%m-%d').date() - today).days <= 60]
             
     all_puts = []
     for exp, dte in valid_expirations:
         try:
             chain = tk.option_chain(exp)
             puts = chain.puts
-            # Estimate mid price. If bid/ask are 0, use lastPrice
-            puts['MidPrice'] = np.where((puts['bid'] > 0) & (puts['ask'] > 0), 
-                                        (puts['bid'] + puts['ask']) / 2, 
-                                        puts['lastPrice'])
-            
-            # Filter out illiquid garbage
+            puts['MidPrice'] = np.where((puts['bid'] > 0) & (puts['ask'] > 0), (puts['bid'] + puts['ask']) / 2, puts['lastPrice'])
             puts = puts[puts['MidPrice'] > 0.05]
             
-            # Calculate Delta
             t_years = dte / 365.0
-            puts['Calculated_Delta'] = puts.apply(
-                lambda row: calc_put_delta(current_price, row['strike'], t_years, RISK_FREE_RATE, row['impliedVolatility']), axis=1
-            )
+            puts['Calculated_Delta'] = puts.apply(lambda row: calc_put_delta(current_price, row['strike'], t_years, RISK_FREE_RATE, row['impliedVolatility']), axis=1)
             puts['Calculated_Delta_100'] = puts['Calculated_Delta'] * 100
-            
-            # Calculate Monthly Multiplier (how many times you can repeat this trade per month)
-            multiplier = 30 / dte 
-            puts['Monthly_Multiplier'] = multiplier
+            puts['Monthly_Multiplier'] = 30 / dte 
             puts['DTE'] = dte
             puts['Expiry'] = exp
             
@@ -133,117 +112,135 @@ def fetch_options_chain(ticker, current_price):
         except Exception:
             continue
             
-    if all_puts:
-        return pd.concat(all_puts, ignore_index=True)
-    return pd.DataFrame()
+    return pd.concat(all_puts, ignore_index=True) if all_puts else pd.DataFrame()
 
 with st.spinner(f"Fetching option chains for {TICKER} (0-60 Days)..."):
     df_options = fetch_options_chain(TICKER, current_price)
 
 if df_options.empty:
-    st.error("No options data available at the moment. Yahoo Finance might be rate limiting.")
+    st.error("No options data available at the moment.")
     st.stop()
 
+# --- CALCULATE SPREADS ---
+def calculate_spreads(df, width):
+    spread_data = []
+    for dte, group in df.groupby('DTE'):
+        for _, short_leg in group.iterrows():
+            short_strike = short_leg['strike']
+            target_long_strike = short_strike - width
+            
+            # Find the closest long strike that is <= target_long_strike
+            long_legs = group[group['strike'] <= target_long_strike]
+            if not long_legs.empty:
+                long_leg = long_legs.loc[long_legs['strike'].idxmax()]
+                net_premium = short_leg['MidPrice'] - long_leg['MidPrice']
+                
+                # Only keep rational pricing (Credit Spreads)
+                if net_premium > 0:
+                    actual_width = short_leg['strike'] - long_leg['strike']
+                    spread_data.append({
+                        'DTE': dte,
+                        'Short_Strike': short_strike,
+                        'Long_Strike': long_leg['strike'],
+                        'Short_Delta_100': short_leg['Calculated_Delta_100'],
+                        'Net_Premium': net_premium,
+                        'Net_Premium_Contract': net_premium * 100,
+                        'Collateral_Contract': actual_width * 100,
+                        'Monthly_Multiplier': short_leg['Monthly_Multiplier']
+                    })
+    return pd.DataFrame(spread_data)
 
-# --- CALCULATE METRICS BASED ON GOALS ---
+df_spreads = calculate_spreads(df_options, spread_width)
+
+# --- CALCULATE GOAL METRICS ---
 df_options['Premium_Contract'] = df_options['MidPrice'] * 100
 df_options['Collateral_Contract'] = df_options['strike'] * 100
 
 if goal_type == "Target Monthly Income":
-    # How many contracts to hit the target monthly income?
-    # Target / (Premium per contract * how many times a month you can sell it)
+    # CSP Metrics
     df_options['Contracts_Needed'] = goal_amount / (df_options['Premium_Contract'] * df_options['Monthly_Multiplier'])
     df_options['Secondary_Metric'] = df_options['Contracts_Needed'] * df_options['Collateral_Contract']
+    
+    # Spread Metrics
+    if not df_spreads.empty:
+        df_spreads['Contracts_Needed'] = goal_amount / (df_spreads['Net_Premium_Contract'] * df_spreads['Monthly_Multiplier'])
+        df_spreads['Secondary_Metric'] = df_spreads['Contracts_Needed'] * df_spreads['Collateral_Contract']
+    
     secondary_y_title = "Collateral Needed ($)"
 else:
-    # How much income can you generate with your capital?
-    # Floor division because you can't sell a fractional contract
+    # CSP Metrics
     df_options['Contracts_Affordable'] = np.floor(goal_amount / df_options['Collateral_Contract'])
     df_options['Secondary_Metric'] = df_options['Contracts_Affordable'] * df_options['Premium_Contract'] * df_options['Monthly_Multiplier']
+    
+    # Spread Metrics
+    if not df_spreads.empty:
+        df_spreads['Contracts_Affordable'] = np.floor(goal_amount / df_spreads['Collateral_Contract'])
+        df_spreads['Secondary_Metric'] = df_spreads['Contracts_Affordable'] * df_spreads['Net_Premium_Contract'] * df_spreads['Monthly_Multiplier']
+    
     secondary_y_title = "Projected Monthly Income ($)"
 
-# --- PLOT 2 & 3: OPTIONS CHARTS ---
-st.subheader("3. Option Chains Analysis")
+# --- HELPER FUNCTION TO PLOT ---
+def plot_options_chart(df, is_spread, x_col, premium_col, delta_col, title):
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Primary Y: Premium
+    marker_config = dict(size=10, color=df[delta_col], colorscale='RdYlGn_r', showscale=True, colorbar=dict(title="Delta")) if delta_col else dict(color='rgba(50, 171, 96, 0.6)')
+    mode_config = 'markers+lines' if delta_col else 'bars'
+    
+    if delta_col:
+        fig.add_trace(go.Scatter(x=df[x_col], y=df[premium_col], name="Net Premium ($)" if is_spread else "Premium ($)",
+                                 mode=mode_config, marker=marker_config, line=dict(color='rgba(150, 150, 150, 0.4)', width=1)), secondary_y=False)
+    else:
+        fig.add_trace(go.Bar(x=df[x_col], y=df[premium_col], name="Net Premium ($)" if is_spread else "Premium ($)", marker=marker_config), secondary_y=False)
+        
+    # Secondary Y: Metric
+    fig.add_trace(go.Scatter(x=df[x_col], y=df['Secondary_Metric'], name=secondary_y_title, 
+                             mode='lines+markers', line=dict(color='purple', width=3)), secondary_y=True)
+    
+    fig.update_layout(title=title, xaxis_title="Days to Expiration (DTE)", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    fig.update_yaxes(title_text="Premium Received ($)" if not is_spread else "Net Spread Premium ($)", secondary_y=False)
+    fig.update_yaxes(title_text=secondary_y_title, secondary_y=True)
+    return fig
+
+# --- PLOT 2: CASH SECURED PUTS ---
+st.subheader("3. Cash-Secured Puts (CSP)")
 colA, colB = st.columns(2)
 
-# --- CHART A: FIXED DELTA ---
 with colA:
-    st.markdown(f"**Best matches for Target Delta: {target_delta}**")
-    
-    # For each DTE, find the strike with the delta closest to the target
-    best_delta_options = df_options.iloc[
-        (df_options['Calculated_Delta_100'] - target_delta).abs().groupby(df_options['DTE']).idxmin()
-    ].sort_values('DTE')
-    
-    fig_delta = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    # Premium Trace
-    fig_delta.add_trace(
-        go.Bar(x=best_delta_options['DTE'], y=best_delta_options['MidPrice'], name="Premium ($)", marker_color='rgba(50, 171, 96, 0.6)'),
-        secondary_y=False,
-    )
-    # Secondary Metric Trace
-    fig_delta.add_trace(
-        go.Scatter(x=best_delta_options['DTE'], y=best_delta_options['Secondary_Metric'], name=secondary_y_title, 
-                   mode='lines+markers', line=dict(color='purple', width=3)),
-        secondary_y=True,
-    )
-    
-    fig_delta.update_layout(title="Premiums vs Expiry (Constant Delta)", xaxis_title="Days to Expiration (DTE)",
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    fig_delta.update_yaxes(title_text="Option Premium ($)", secondary_y=False)
-    fig_delta.update_yaxes(title_text=secondary_y_title, secondary_y=True)
-    
-    st.plotly_chart(fig_delta, use_container_width=True)
+    # Match Target Delta
+    csp_delta = df_options.iloc[(df_options['Calculated_Delta_100'] - target_delta).abs().groupby(df_options['DTE']).idxmin()].sort_values('DTE')
+    st.plotly_chart(plot_options_chart(csp_delta, False, 'DTE', 'MidPrice', None, f"CSP Premiums (Target Delta: {target_delta})"), use_container_width=True)
 
-# --- CHART B: FIXED STRIKE ---
 with colB:
-    st.markdown(f"**Premiums for Fixed Strike: ${user_strike}**")
+    # Fixed Strike
+    csp_strike = df_options[df_options['strike'] == user_strike].sort_values('DTE')
+    if csp_strike.empty: st.warning(f"No CSP volume found at Strike ${user_strike}.")
+    else: st.plotly_chart(plot_options_chart(csp_strike, False, 'DTE', 'MidPrice', 'Calculated_Delta_100', f"CSP Premiums (Strike = ${user_strike})"), use_container_width=True)
+
+# --- PLOT 3: PUT CREDIT SPREADS ---
+st.subheader("4. Put Credit Spreads (PCS)")
+
+if df_spreads.empty:
+    st.warning("Could not calculate spreads. The chosen spread width might be too narrow/wide for the available options chain data.")
+else:
+    colC, colD = st.columns(2)
     
-    # Filter for the specific strike chosen by the user
-    fixed_strike_options = df_options[df_options['strike'] == user_strike].sort_values('DTE')
-    
-    if fixed_strike_options.empty:
-        st.warning(f"No active option volume found exactly at Strike ${user_strike}. Try adjusting the strike.")
-    else:
-        fig_strike = make_subplots(specs=[[{"secondary_y": True}]])
+    with colC:
+        # Match Target Delta for the SHORT leg
+        pcs_delta = df_spreads.iloc[(df_spreads['Short_Delta_100'] - target_delta).abs().groupby(df_spreads['DTE']).idxmin()].sort_values('DTE')
+        st.plotly_chart(plot_options_chart(pcs_delta, True, 'DTE', 'Net_Premium', None, f"PCS Net Premiums (Short Leg Delta: {target_delta})"), use_container_width=True)
         
-        # We will use a Scatter plot with color gradient to represent the Delta of the option
-        fig_strike.add_trace(
-            go.Scatter(
-                x=fixed_strike_options['DTE'], 
-                y=fixed_strike_options['MidPrice'], 
-                name="Premium ($)", 
-                mode='markers+lines',
-                marker=dict(
-                    size=12,
-                    color=fixed_strike_options['Calculated_Delta_100'],
-                    colorscale='RdYlGn_r', # Red = High Delta (Risk), Green = Low Delta (Safe)
-                    showscale=True,
-                    colorbar=dict(title="Delta")
-                ),
-                line=dict(color='rgba(150, 150, 150, 0.4)', width=1)
-            ),
-            secondary_y=False,
-        )
-        
-        # Secondary Metric Trace
-        fig_strike.add_trace(
-            go.Scatter(x=fixed_strike_options['DTE'], y=fixed_strike_options['Secondary_Metric'], name=secondary_y_title, 
-                       mode='lines+markers', line=dict(color='purple', width=3)),
-            secondary_y=True,
-        )
-        
-        fig_strike.update_layout(title=f"Premiums vs Expiry (Strike = ${user_strike})", xaxis_title="Days to Expiration (DTE)",
-                                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        fig_strike.update_yaxes(title_text="Option Premium ($)", secondary_y=False)
-        fig_strike.update_yaxes(title_text=secondary_y_title, secondary_y=True)
-        
-        st.plotly_chart(fig_strike, use_container_width=True)
+    with colD:
+        # Fixed Short Strike
+        pcs_strike = df_spreads[df_spreads['Short_Strike'] == user_strike].sort_values('DTE')
+        if pcs_strike.empty: 
+            st.warning(f"No Put Credit Spread volume found where short strike is ${user_strike}.")
+        else:
+            st.plotly_chart(plot_options_chart(pcs_strike, True, 'DTE', 'Net_Premium', 'Short_Delta_100', f"PCS Net Premiums (Short Strike = ${user_strike})"), use_container_width=True)
 
 st.markdown("""
 ---
-**Important Mathematical Notes:** 
-1. **Target Income Scaling:** To achieve a monthly goal with options that expire in less (or more) than 30 days, the calculation scales the premium by `(30 / DTE)`. For example, a 15 DTE option assumes you can roll/sell it 2 times per month.
-2. **Delta Calculation:** Free options APIs don't reliably stream "Greeks", so Delta is calculated dynamically here using the Black-Scholes formula, mapping the option's Implied Volatility back to a Delta.
+**Important Technical Notes:** 
+1. **Spread Collateral Definition:** For Put Credit Spreads, collateral is calculated strictly as `Spread Width × 100` per contract. Some brokers subtract the premium received from your gross collateral requirement, but this uses gross collateral to be conservative.
+2. **Spread Construction:** The program iterates through every put, assumes it is the "Short" leg, subtracts your requested spread width, and "Buys" the closest valid strike below that threshold to calculate the Net Premium.
 """)
