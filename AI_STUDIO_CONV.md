@@ -60,4 +60,7 @@ Regarding Target vs Capital toggle, yes show projected monthly income if the use
 ### User
 Say we sell put credit spreads instead. Can you enhance the app to show those as a separate graph? 
 
+## Session 3
+### User
+Can you call out the contracts that I should sell along with the number of such contracts as well when I click on a point in the graph?
 
