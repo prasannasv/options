@@ -32,6 +32,10 @@ def get_historical_data(ticker):
     return df
 
 df_price = get_historical_data(TICKER)
+if df_price is None or df_price.empty:
+    st.error(f"⚠️ Failed to fetch historical price data for {TICKER} from Yahoo Finance. They may be temporarily rate-limiting the server. Please try again in a few minutes.")
+    st.stop()
+
 current_price = float(df_price['Close'].iloc[-1].iloc[0]) if isinstance(df_price['Close'].iloc[-1], pd.Series) else float(df_price['Close'].iloc[-1])
 default_strike = float(df_price['SMA_50'].iloc[-1].iloc[0]) if isinstance(df_price['SMA_50'].iloc[-1], pd.Series) else float(df_price['SMA_50'].iloc[-1])
 if np.isnan(default_strike): default_strike = current_price
